@@ -5,7 +5,7 @@ import sqlite3
 import sys
 
 STATE_CODE = "NV"
-DB_PATH = "/home/rfesler/landdb/data/nevada_land.sqlite"
+DB_PATH = "/home/pi/landdb/data/nevada_land.sqlite"
 
 TABLES = {
     "ownership": "blm_sma_raw",

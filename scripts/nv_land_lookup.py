@@ -4,9 +4,17 @@ import math
 import sqlite3
 import sys
 
-DB_PATH = "/home/pi/landdb/data/nevada_land.sqlite"
+STATE_CODE = "NV"
+DB_PATH = "/home/rfesler/landdb/data/nevada_land.sqlite"
 
-OWNERSHIP_SQL = """
+TABLES = {
+    "ownership": "blm_sma_raw",
+    "padus": "padus_raw",
+    "plad_areas": "plad_areas_raw",
+    "plad_routes": "plad_routes_raw",
+}
+
+OWNERSHIP_SQL = f"""
 SELECT
     NAME,
     ABBR,
@@ -24,33 +32,12 @@ SELECT
         WHEN ABBR = 'WTR'  THEN 'Water'
         ELSE 'Unknown'
     END AS land_class
-FROM blm_sma_raw
+FROM {TABLES["ownership"]}
 WHERE ST_Contains(shape, MakePoint(?, ?, 4326))
 LIMIT 1;
 """
 
-PADUS_SQL = """
-SELECT
-    Unit_Nm,
-    Own_Name,
-    Mang_Name,
-    CASE
-        WHEN Own_Name = 'TRIB' OR Mang_Name = 'TRIB' THEN 'Reservation / Tribal'
-        WHEN Own_Name = 'BLM'  OR Mang_Name = 'BLM'  THEN 'BLM'
-        WHEN Own_Name = 'USFS' OR Mang_Name = 'USFS' THEN 'National Forest'
-        WHEN Own_Name = 'DOD'  OR Mang_Name = 'DOD'  THEN 'Military'
-        WHEN Own_Name = 'DOE'  OR Mang_Name = 'DOE'  THEN 'DOE / Federal Restricted'
-        WHEN Own_Name = 'USBR' OR Mang_Name = 'USBR' THEN 'Bureau of Reclamation'
-        WHEN Own_Name = 'CNTY' OR Mang_Name = 'CNTY' THEN 'County Land'
-        WHEN Own_Name = 'CITY' OR Mang_Name = 'CITY' THEN 'City Land'
-        ELSE 'Public / Protected'
-    END AS land_class
-FROM padus_raw
-WHERE ST_Contains(shape, MakePoint(?, ?, 4326))
-LIMIT 1;
-"""
-
-PLAD_AREA_SQL = """
+PLAD_AREA_SQL = f"""
 SELECT
     ACS_RGHTS_TYPE,
     LEGAL_USE_TYPE,
@@ -58,12 +45,12 @@ SELECT
     TRVL_PLAN_YN,
     GEO_NAME,
     ROUTE_NO
-FROM plad_areas_raw
+FROM {TABLES["plad_areas"]}
 WHERE ST_Contains(shape, MakePoint(?, ?, 4326))
 LIMIT 1;
 """
 
-PLAD_ROUTE_SQL = """
+PLAD_ROUTE_SQL = f"""
 SELECT
     ACS_RGHTS_TYPE,
     LEGAL_USE_TYPE,
@@ -75,7 +62,7 @@ SELECT
         shape,
         MakePoint(?, ?, 4326)
     ) AS dist_deg
-FROM plad_routes_raw
+FROM {TABLES["plad_routes"]}
 ORDER BY dist_deg ASC
 LIMIT 1;
 """
@@ -136,9 +123,66 @@ def fail(message: str, code: int = 1) -> None:
     sys.exit(code)
 
 
+def get_table_columns(cur: sqlite3.Cursor, table_name: str) -> list[str]:
+    cur.execute(f"PRAGMA table_info({table_name})")
+    return [row[1] for row in cur.fetchall()]
+
+
+def pick_column(columns: list[str], candidates: list[str]) -> str | None:
+    lookup = {col.lower(): col for col in columns}
+    for candidate in candidates:
+        if candidate.lower() in lookup:
+            return lookup[candidate.lower()]
+    return None
+
+
+def build_padus_sql(cur: sqlite3.Cursor) -> str | None:
+    columns = get_table_columns(cur, TABLES["padus"])
+
+    unit_col = pick_column(columns, [
+        "Unit_Nm", "UNIT_NM", "unit_nm",
+        "Unit_Name", "UNIT_NAME", "unit_name",
+        "Name", "NAME", "name",
+    ])
+    own_col = pick_column(columns, [
+        "Own_Name", "OWN_NAME", "own_name",
+        "Own_Type", "OWN_TYPE", "own_type",
+        "Owner", "OWNER", "owner",
+    ])
+    mang_col = pick_column(columns, [
+        "Mang_Name", "MANG_NAME", "mang_name",
+        "Mang_Type", "MANG_TYPE", "mang_type",
+        "Manager", "MANAGER", "manager",
+    ])
+
+    if not unit_col or not own_col or not mang_col:
+        return None
+
+    return f"""
+    SELECT
+        {unit_col},
+        {own_col},
+        {mang_col},
+        CASE
+            WHEN {own_col} = 'TRIB' OR {mang_col} = 'TRIB' THEN 'Reservation / Tribal'
+            WHEN {own_col} = 'BLM'  OR {mang_col} = 'BLM'  THEN 'BLM'
+            WHEN {own_col} = 'USFS' OR {mang_col} = 'USFS' THEN 'National Forest'
+            WHEN {own_col} = 'DOD'  OR {mang_col} = 'DOD'  THEN 'Military'
+            WHEN {own_col} = 'DOE'  OR {mang_col} = 'DOE'  THEN 'DOE / Federal Restricted'
+            WHEN {own_col} = 'USBR' OR {mang_col} = 'USBR' THEN 'Bureau of Reclamation'
+            WHEN {own_col} = 'CNTY' OR {mang_col} = 'CNTY' THEN 'County Land'
+            WHEN {own_col} = 'CITY' OR {mang_col} = 'CITY' THEN 'City Land'
+            ELSE 'Public / Protected'
+        END AS land_class
+    FROM {TABLES["padus"]}
+    WHERE ST_Contains(shape, MakePoint(?, ?, 4326))
+    LIMIT 1;
+    """
+
+
 def main() -> None:
     if len(sys.argv) != 3:
-        fail("usage: nv_land_lookup.py <lat> <lon>")
+        fail("usage: land_lookup.py <lat> <lon>")
 
     try:
         lat = float(sys.argv[1])
@@ -155,9 +199,11 @@ def main() -> None:
         conn.load_extension("mod_spatialite")
         cur = conn.cursor()
 
+        padus_sql = build_padus_sql(cur)
+
         result = {
             "ok": True,
-            "state": "NV",
+            "state": STATE_CODE,
             "lat": lat,
             "lon": lon,
             "land_class": "Unknown",
@@ -189,16 +235,16 @@ def main() -> None:
             result["land_name"] = row[0]
             result["land_code"] = row[1]
             result["land_class"] = row[2]
-            result["land_source"] = "blm_sma_raw"
-        else:
-            cur.execute(PADUS_SQL, (lon, lat))
+            result["land_source"] = TABLES["ownership"]
+        elif padus_sql:
+            cur.execute(padus_sql, (lon, lat))
             row = cur.fetchone()
             if row:
                 result["fallback_unit_name"] = row[0]
                 result["land_code"] = row[1] or row[2]
                 result["land_name"] = row[0]
                 result["land_class"] = row[3]
-                result["land_source"] = "padus_raw"
+                result["land_source"] = TABLES["padus"]
 
         cur.execute(PLAD_AREA_SQL, (lon, lat))
         row = cur.fetchone()
